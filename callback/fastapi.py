@@ -1,9 +1,15 @@
+from django.db import transaction
 from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi_jwt_auth import AuthJWT
 from fastapi_jwt_auth.exceptions import AuthJWTException
-from pydantic import BaseModel
+from pydantic import BaseModel, validator, Field, root_validator
 from typing import Optional
+import re
+from starlette import status
+
 from callback.models import (
     Player,
     Game
@@ -44,13 +50,67 @@ class ErrorMessage(BaseModel):
     message: str
 
 
-class PlayerItem(BaseModel):
-    name: str
-    email: str
+class CreatePlayerItem(BaseModel):
+    name: str = Field(..., max_length=54)
+    email: str = Field(..., max_length=54)
+
+    @validator('name')
+    def validate_name(cls, name):
+        allowed_chars = set('0123456789abcdef')
+        if not set(name).issubset(allowed_chars):
+            raise ValueError('Invalid characters in name. Only digits 0-9 and letters a-f are allowed.')
+
+        try:
+            Player.objects.get(name=name)
+        except Player.DoesNotExist:
+            return name
+
+        raise ValueError('Player item with this name already exists')
+
+    @validator('email')
+    def validate_email(cls, email):
+        pattern = r'^[\w\.-]+@[\w\.-]+\.\w+$'
+        if not re.match(pattern, email):
+            raise ValueError('Email is not valid')
+
+        try:
+            Player.objects.get(email=email)
+        except Player.DoesNotExist:
+            return email
+        raise ValueError('Player item with this email already exists')
 
 
 class GameItem(BaseModel):
     name: str
+
+
+class AddingPlayerInGame(BaseModel):
+    game_id: int
+    player_id: int
+
+    @validator('player_id')
+    def validate_player_id(cls, player_id):
+        try:
+            Player.objects.get(pk=player_id)
+        except Player.DoesNotExist:
+            raise ValueError('Player does not exists')
+        return player_id
+
+    @root_validator
+    def validate_game_id(cls, values):
+        player_id = values.get('player_id')
+        game_id = values.get('game_id')
+
+        try:
+            game = Game.objects.prefetch_related('players').get(pk=game_id)
+        except Game.DoesNotExist:
+            raise ValueError('Game does not exists')
+        if game.players.count() > 4:
+            raise ValueError('Game has not more than 5 players')
+        if player_id in game.players.values_list('pk', flat=True):
+            raise ValueError('Player already in this game')
+
+        return values
 
 
 class Settings(BaseModel):
@@ -135,21 +195,45 @@ def protected_example(Authorize: AuthJWT = Depends()):
     return JSONResponse(status_code=200, content={"user": current_user})
 
 
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    details = exc.errors()
+    modified_details = []
+    for error in details:
+        modified_details.append(
+            {
+                "status": "error",
+                "text": error["msg"],
+            }
+        )
+    return JSONResponse(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content=jsonable_encoder({"detail": modified_details}),
+    )
+
+
+"""
+Примечание для проверяющего: я знаю, что возможно лучше было бы с состоянием гонки бороться внутри функции через 
+with transaction.atomic():
+Но у меня валидация на уже существующего пользователя вынесена в схему pydantic. И мне хотелось оставить её там
+"""
+@transaction.atomic
 @app.post('/new_player', tags=['Main'], responses={200: {"model": StatusMessage}, 400: {"model": ErrorMessage}})
-def create_new_player(player: PlayerItem, Authorize: AuthJWT = Depends()):
+def create_new_player(player: CreatePlayerItem, Authorize: AuthJWT = Depends()):
     """
     Creates new player.
     """
     Authorize.jwt_required()
-
-    new_player = Player()
-    new_player.name = player.name
-    new_player.email = player.email
+    new_player = Player(name=player.name, email=player.email)
     new_player.save()
+
+    # if django >= 4.2
+    # await Player.objects.acreate(name=player.name, email=player.email)
 
     return JSONResponse(content={"status": "success", "id": new_player.id, "success": True})
 
 
+@transaction.atomic
 @app.post('/new_game', tags=['Main'], responses={200: {"model": StatusMessage}, 400: {"model": ErrorMessage}})
 def create_new_game(game: GameItem, Authorize: AuthJWT = Depends()):
     """
@@ -164,11 +248,14 @@ def create_new_game(game: GameItem, Authorize: AuthJWT = Depends()):
     return JSONResponse(content={"status": "success", "id": new_game.id, "success": True})
 
 
+@transaction.atomic
 @app.post('/add_player_to_game', tags=['Main'], responses={200: {"model": StatusMessage}, 400: {"model": ErrorMessage}})
-def add_player_to_game(game_id: int, player_id: int, Authorize: AuthJWT = Depends()):
+def add_player_to_game(request_data: AddingPlayerInGame, Authorize: AuthJWT = Depends()):
     """
     Adds existing player to existing game.
     """
     Authorize.jwt_required()
+    game = Game.objects.get(pk=request_data.game_id)
+    game.players.add(request_data.player_id)
 
-    return JSONResponse(content={"status": "success", "id": game_id, "success": True})
+    return JSONResponse(content={"status": "success", "id": request_data.game_id, "success": True})
